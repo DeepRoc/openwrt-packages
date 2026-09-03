@@ -16,6 +16,7 @@ PKG_SOURCE:=$(PKG_NAME)-$(PKG_REALVERSION).tar.gz
 PKG_SOURCE_URL:=https://www.sudo.ws/dist
 PKG_HASH:=4a38a1ab3adb1199257edc2a7c4a2bd714665eb605b04368843b06dada2cfcfb
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_REALVERSION)
+PKG_BUILD_DEPENDS:=libmd
 
 PKG_MAINTAINER:=Alexandru Ardelean <ardeleanalex@gmail.com>
 

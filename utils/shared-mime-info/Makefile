@@ -22,6 +22,7 @@ PKG_BUILD_DEPENDS:=gettext-full/host
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/nls.mk
+include $(INCLUDE_DIR)/host-build.mk
 include $(INCLUDE_DIR)/meson.mk
 
 define Package/shared-mime-info
@@ -36,7 +37,13 @@ define Package/shared-mime-info/description
 	The shared-mime-info package contains a database of MIME types and their file extensions.
 endef
 
-MESON_ARG += \
+MESON_ARGS += \
+	-Dbuild-tests=false \
+	-Dupdate-mimedb=false \
+	-Dbuild-tools=true \
+	-Dbuild-translations=false
+
+MESON_HOST_ARGS += \
 	-Dbuild-tests=false \
 	-Dupdate-mimedb=false \
 	-Dbuild-tools=true \
@@ -44,9 +51,15 @@ MESON_ARG += \
 
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib/pkgconfig
-	$(CP) \
-		$(PKG_INSTALL_DIR)/usr/share/pkgconfig/shared-mime-info.pc \
-		$(1)/usr/lib/pkgconfig/
+	$(CP) $(PKG_INSTALL_DIR)/usr/share/pkgconfig/shared-mime-info.pc \
+	      $(1)/usr/lib/pkgconfig/
+endef
+
+Hooks/HostInstall/Post += HostBuild/Install/PkgConfig
+
+define HostBuild/Install/PkgConfig
+	$(CP)	$(HOST_BUILD_PREFIX)/share/pkgconfig/shared-mime-info.pc \
+		$(HOST_BUILD_PREFIX)/lib/pkgconfig/
 endef
 
 define Package/shared-mime-info/install
@@ -65,3 +78,4 @@ define Package/shared-mime-info/install
 endef
 
 $(eval $(call BuildPackage,shared-mime-info))
+$(eval $(call HostBuild))
