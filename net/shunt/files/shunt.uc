@@ -8,10 +8,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Dirk Brenken <dev@brenken.org>
 
-import { popen, writefile, readfile, unlink, mkdir, error as fs_error } from 'fs';
+import { popen, writefile, readfile, unlink, mkdir, access, error as fs_error } from 'fs';
 import { openlog, syslog, LOG_PID, LOG_DAEMON, LOG_ERR, LOG_WARNING,
 	LOG_NOTICE, LOG_INFO, LOG_DEBUG } from 'log';
-import { load as cfg_load, parse as cfg_parse } from 'shunt.config';
+import { load as cfg_load, parse as cfg_parse, MIN as cfg_min } from 'shunt.config';
 import { compile as match_compile } from 'shunt.match';
 import { load as files_load, DIR as FILES_DIR } from 'shunt.domain_file';
 import { action_name, compile as nft_compile, refresh, teardown, TABLE } from 'shunt.nft';
@@ -287,6 +287,17 @@ function check_rp_filter(policies) {
 			dev, dev));
 }
 
+// kmod-nft-tproxy is not a dependency, so a tproxy policy may name a module
+// that is not there - and nft loads the ruleset as one batch, so one rule
+// the kernel cannot resolve would take every policy down. Loaded, or
+// installed and left to the kernel's autoload on first use.
+function tproxy_available() {
+	let rel = trim(readfile('/proc/sys/kernel/osrelease') ?? '');
+
+	return !!(access('/sys/module/nft_tproxy') ||
+		(length(rel) && access(`/lib/modules/${rel}/nft_tproxy.ko`)));
+}
+
 // silent: build only what a teardown consumes and say nothing about the
 // configuration - flush() needs route.del and nothing else.
 function build_state(silent) {
@@ -312,7 +323,10 @@ function build_state(silent) {
 		report('domain', matcher.issues);
 	}
 
-	let n = nft_compile(cfg.policies);
+	// A teardown renders without the check: a policy whose module has
+	// gone since it was applied still owns a table and rules to remove.
+	let n = nft_compile(cfg.policies,
+		{ tproxy: silent ? true : tproxy_available() });
 	if (!silent)
 		report('nft', n.issues);
 
@@ -332,10 +346,24 @@ const WRITE_MIN = 2;
 const WRITE_MAX = 60;
 const WRITE_FACTOR = 3;
 
+// A write from snoop carries the TTL of the answer it was learned from; one
+// from poll carries none. Either way the element lives no longer than
+// entry_ttl and no shorter than its floor, so a zero TTL still gets a few
+// seconds of coverage and a week-long one does not pin a stale address.
 function queue_writes(st, writes, now) {
-	for (let w in writes)
-		if (st.state.nft.learn[w.set] && st.cache.due(w.set, w.addr, now))
+	let max = st.state.cfg.global.entry_ttl;
+	let min = cfg_min.entry_ttl;
+
+	for (let w in writes) {
+		if (!st.state.nft.learn[w.set])
+			continue;
+
+		let ttl = w.ttl ?? max;
+		w.ttl = (ttl < min) ? min : (ttl > max) ? max : ttl;
+
+		if (st.cache.due(w.set, w.addr, now, w.ttl))
 			st.pending[`${w.set}/${w.addr}`] = w;
+	}
 }
 
 function drain_writes(st) {
@@ -646,9 +674,9 @@ function run() {
 					let writes = [];
 					for (let policy in v.policies) {
 						for (let a in v.a)
-							push(writes, { set: `d4_${policy}`, addr: a });
+							push(writes, { set: `d4_${policy}`, addr: a, ttl: v.ttl });
 						for (let a in v.aaaa)
-							push(writes, { set: `d6_${policy}`, addr: a });
+							push(writes, { set: `d6_${policy}`, addr: a, ttl: v.ttl });
 					}
 
 					debug(sprintf('snoop: %s -> %s (%d addr)',
@@ -735,6 +763,9 @@ function check() {
 	for (let m in state.nft.marks)
 		if (m.action == 'bypass')
 			printf('  %-16s bypass\n', m.name);
+		else if (m.action == 'tproxy')
+			printf('  %-16s mark 0x%08x  table %d  pref %d  tproxy :%d\n',
+				m.name, m.mark, m.rt_table, m.rt_prio, m.port);
 		else
 			printf('  %-16s mark 0x%08x  table %d  pref %d\n',
 				m.name, m.mark, m.rt_table, m.rt_prio);

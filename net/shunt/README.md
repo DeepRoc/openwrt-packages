@@ -52,7 +52,7 @@ shunt check
 * Wildcard domains (`*.example.com`), learned passively as clients use them
 * Domain lists from a file - a community-maintained set of thousands of names, without a single UCI entry per name
 * Per-policy killswitch: hold the traffic when the interface drops, instead of leaking it out of the normal uplink
-* Per-policy action: `route` marks the traffic for the policy interface, `bypass` exempts it from every policy below
+* Per-policy action: `route` marks the traffic for the policy interface, `bypass` exempts it from every policy below, `tproxy` hands it to a transparent proxy on the router
 * Your own networks stay reachable from a policy client, without listing them anywhere
 * Puts its own table back when something deletes it, `fw4 flush` included
 * Own nftables table and routing tables, disjoint mark range - runs beside `pbr` and `mwan3`
@@ -64,6 +64,8 @@ shunt check
 ## Prerequisites
 * OpenWrt with fw4/nftables
 * `ucode` plus `ucode-mod-fs`, `ucode-mod-socket`, `ucode-mod-uci`, `ucode-mod-uloop`, `ucode-mod-resolv`, `ucode-mod-ubus`, `ucode-mod-rtnl`, `ucode-mod-log` and `rpcd-mod-ucode` - all pulled in by the package; `ip` is not needed, routes and rules are written over rtnetlink
+
+`kmod-nft-tproxy` only for a `tproxy` policy. It is not pulled in: without it a tproxy policy is skipped as an issue and everything else is applied.
 
 `ucode-mod-resolv` and `ucode-mod-ubus` are soft at runtime: without resolv, poll is skipped and the observer carries the service alone; without ubus, gateway discovery and interface events are skipped and the config's own values are used. Both cost one warning in the log, not a failed start.
 
@@ -173,11 +175,11 @@ Logging goes to syslog under the tag `shunt`, so `logread -e shunt` shows everyt
 | debug | `0` | log every observed answer and every set write |
 | rp_filter_manage | `0` | set rp_filter=2 on shunt's own policy devices, at start and on ifup |
 | poll_interval | `300` | seconds between poll cycles, at least 30 |
-| entry_ttl | `1200` | nftables timeout on learned elements, at least 60 |
+| entry_ttl | `1200` | ceiling for the nftables timeout on learned elements, at least 60 |
 | snoop | `1` | enable the passive DNS observer |
 | snoop_device | `br-lan` | LAN devices to observe, a list, one entry per segment |
 
-Values below the minimum are clamped, not rejected, and the clamp is logged. `entry_ttl` should stay well above `poll_interval` - an element is rewritten once its remaining timeout drops below half of `entry_ttl`, so the default pair refreshes comfortably within two poll cycles.
+Values below the minimum are clamped, not rejected, and the clamp is logged. `entry_ttl` should stay well above `poll_interval` - a polled element is rewritten once its remaining timeout drops below half of `entry_ttl`, so the default pair refreshes comfortably within two poll cycles. Elements learned by snoop expire with the TTL of the answer instead, see [How addresses are learned](#how-addresses-are-learned).
 
 ### Policy sections
 
@@ -186,9 +188,10 @@ Each `config policy` section is one routing policy. **The section must be named,
 | Option | Description |
 | :--- | :--- |
 | enabled | `0` skips the section entirely |
-| action | `route` (default) or `bypass`, see below |
+| action | `route` (default), `bypass` or `tproxy`, see below |
 | interface | netifd logical name (`wan`, `trm_wwan`) or raw netdev (`wg0`, `phy0-sta0`); `route` only |
-| fallback | `main` (default) or `block`, see below; `route` only |
+| tproxy_port | port the transparent proxy listens on; `tproxy` only, required there |
+| fallback | `main` (default) or `block`, see below; `route` and `tproxy` |
 | keep_local | `1` (default) keeps traffic on `main` where `main` has a route for it, see below; `route` only |
 | gw4 / gw6 | gateway override; normally unnecessary |
 | src | client addresses or CIDRs whose traffic this policy owns |
@@ -276,7 +279,7 @@ Run from cron that covers the reboot case as well: the first run after boot crea
 
 What a large list costs: 100k patterns take about two seconds to load and roughly 40 MB of memory on an x86 test box, so expect several seconds and a proportionally smaller footprint on a router, at start and on every refresh. A file above 4 MiB is refused outright as an issue. `shunt check` prints how many files were read and how many patterns they contributed, `shunt refresh` does the same for the running daemon, and `ubus call shunt status` shows the count under `files` together with the time of the last refresh.
 
-### Actions: route or bypass
+### Actions: route, bypass or tproxy
 
 `action 'route'` (default) is the policy shape everything above describes: matching traffic is marked and looked up in the policy's own table.
 
@@ -296,6 +299,40 @@ config policy 'vpn'
 ```
 
 Order matters and only order: a bypass section placed after the policy it is meant to except from never sees the packet.
+
+<a id="transparent-proxy-tproxy"></a>
+### Transparent proxy: tproxy
+
+`action 'tproxy'` hands the selected traffic to a transparent proxy running on the router - `hev-socks5-tproxy`, `sing-box` or `xray` in tproxy mode, or anything else that accepts `IP_TRANSPARENT` connections. shunt only steers: it does not start, configure or watch the proxy. It needs `kmod-nft-tproxy`.
+
+```
+config policy 'proxy'
+	option action      'tproxy'
+	option tproxy_port '1088'
+	option fallback    'block'
+	list   src         '192.168.1.0/24'
+	list   domain      '*.example.com'
+```
+
+The selectors are the usual ones. tproxy carries tcp and udp only, so a tproxy policy without `proto` covers both, and the proxy must listen for every protocol the policy selects. A policy consumes a mark and gets a routing table holding a single `local default dev lo` route - that is how the selected packets reach a socket on the router without their destination being rewritten.
+
+shunt delivers to `127.0.0.1` and `::1`. A proxy listening on loopback or on the wildcard address is found; one bound to the router's LAN address is not. The address is not left to the kernel on purpose: without one it picks the address of the incoming interface, and a proxy bound to loopback would never be found - the statement fails silently and the traffic is not proxied.
+
+`fallback` decides what a **new** flow does when no listener is found - proxy stopped, crashed, wrong port: `main` (default) lets it take the normal uplink, `block` drops it. A flow that was already proxied is dropped either way once its listener is gone. Its state is in the proxy, and its conntrack entry was never NATed, so forwarding the rest of it would put the client's own address on the uplink - measured, which is why this does not follow `fallback`.
+
+`interface`, `keep_local` and the gateway overrides are not read, and `keep_local '1'` set explicitly is reported. It would break the policy: main would forward packets the kernel has already handed to the proxy's socket, and the kernel drops those.
+
+Only traffic passing through the router is proxied. tproxy exists in the prerouting hook alone, so the router's own traffic is not touched by a tproxy policy - which also keeps the proxy's upstream connections from looping back into it.
+
+The proxied traffic is delivered to the router itself, so fw4 applies its **input** rules, not its forward rules. On `lan`, with input `ACCEPT`, nothing needs doing. A zone with input `REJECT` or `DROP` - a guest network, typically - drops it, and shunt cannot override that from its own table, because a drop in any base chain is final. The packet still carries its original destination port, so a rule on the proxy port does not match; match the policy's mark instead (`shunt check` prints it):
+
+```
+config rule
+	option name   'Allow-guest-tproxy'
+	option src    'guest'
+	option mark   '0x01000000/0xff000000'
+	option target 'ACCEPT'
+```
 
 <a id="local-traffic-keep_local"></a>
 ### Local traffic: keep_local
@@ -332,10 +369,14 @@ Two sources feed the same nftables sets, union with an element timeout. They are
 * **poll** resolves the configured names through whatever system resolver exists, on a fixed interval. It warms the sets before the first client packet, so first contact does not race. Wildcards are not names and cannot be polled, and names from a `domain_file` are not polled by design - see [Domain lists from a file](#domain-lists-from-a-file).
 * **snoop** passively observes DNS responses on the LAN side via AF_PACKET with a BPF filter matching **UDP source port 53** - answers, not questions - including one level of VLAN tagging. It covers CDN variance and wildcards, which poll cannot. It reads; it never writes anything back onto the wire and never sits between a client and its resolver. If it dies, DNS keeps working and only the policy stops applying.
 
+The two sources differ in how long an element lives. A snooped element carries the TTL of the answer it came from - the shortest one, when a message mixes several - clamped to the range 60 to `entry_ttl` seconds. So an address a CDN hands out for 30 seconds is gone from the set within a minute of the last answer that named it, while a name with a day-long TTL is capped at `entry_ttl` and re-learned on its next answer. A polled element carries `entry_ttl`: the resolver interface hands back addresses without their TTL, so poll has nothing better than the ceiling. Where both sources see the same address the shorter bound wins - the next snooped answer cuts a polled element down to its TTL, and the write cache only rewrites an element when the new expiry moves by at least half of the lifetime the answer carries, so a burst of identical answers costs one write.
+
+This is also the honest answer to the question every IP-based policy router gets: what about a CDN address that the domain stops using while some other site starts to? Nothing on layer 3 can tell two names apart once they share an address, shunt included. What shunt can do is not keep the address longer than the resolver would have, which is exactly what the TTL says.
+
 <a id="what-polling-costs"></a>
 ### What polling costs
 
-"Polling" invites the assumption of waste, so here is the arithmetic. One cycle is a single call asking for A and AAAA of every listed name: two lookups per name per interval, against the **local** resolver. Ten names at the default 300 seconds is 240 lookups an hour - about what a dozen web page loads cost, on a network whose own DNS traffic runs to hundreds of answers in a few minutes. There is no polling of anything else: no interface scanning, no ruleset re-rendering, no periodic writes. An element is only rewritten when its remaining lifetime has dropped below half.
+"Polling" invites the assumption of waste, so here is the arithmetic. One cycle is a single call asking for A and AAAA of every listed name: two lookups per name per interval, against the **local** resolver. Ten names at the default 300 seconds is 240 lookups an hour - about what a dozen web page loads cost, on a network whose own DNS traffic runs to hundreds of answers in a few minutes. There is no polling of anything else: no interface scanning, no ruleset re-rendering, no periodic writes. A polled element is only rewritten when its remaining lifetime has dropped below half.
 
 Two costs worth knowing:
 
@@ -461,13 +502,14 @@ table inet shunt                     own table, see below
   set m_<policy>                     client MACs, no family digit, counter
 
 fwmark                               <index> << 24, mask 0xff000000
+ct mark                              same bits, set on a flow's first packet
 ip rule pref                         31000 + <index> keep_local's main lookup
                                      31500 + <index> the policy table
-routing table                        8000 + <index>
+routing table                        8000 + <index>, for tproxy: local default dev lo
 /etc/iproute2/rt_tables.d/shunt.conf the table name mapping, for `ip route show` only
 ```
 
-A `bypass` policy is only a rule in the prerouting and output chains: no mark, no table, no ip rule, and it does not count against the 255. The mark mask is fixed at `0xff000000`, which allows 255 policies. The `output` chain is `type route` so the router's own marked traffic is re-routed after the mark is set.
+A `bypass` policy is only a rule in the prerouting and output chains: no mark, no table, no ip rule, and it does not count against the 255. A `tproxy` policy has rules in prerouting only, and no keep_local rule. The mark mask is fixed at `0xff000000`, which allows 255 policies. The `output` chain is `type route` so the router's own marked traffic is re-routed after the mark is set.
 
 Every set carries per-element counters, so "is this element ever hit" is one look at `nft list set inet shunt <set>` rather than a tcpdump session. The two kinds count different things: nftables tests a rule left to right, so a **client** set counts every packet that matched the selector, whether or not the destination matched afterwards; a **learned** set is the last lookup in the rule, so a hit there means the packet really was marked. A busy client beside learned addresses at zero is a client that has not visited any of the routed domains, not a fault.
 
@@ -486,6 +528,8 @@ The interval follows what the last write actually cost, between 2 and 60 seconds
 
 **A reload wipes learned state.** Applying the configuration destroys and re-creates the table atomically, so the learned sets start empty. poll rewarms them within one interval and snoop refills from live traffic; expect a short window after a restart where domain policies do not apply yet.
 
+**A flow is routed once, on its first packet.** The mark a `route` policy sets is also written to the flow's conntrack entry, and every later packet of the flow in the original direction takes its mark from there and never reaches the set lookups; flows that got no mark, or a `bypass`, stay settled the same way. That is what makes a set change safe for connections already running: the kernel kills a masqueraded conntrack entry whose output interface changes, so re-marking a live flow would reset it - measured, not assumed. The same rule holds across a reload. Conntrack survives it, so a connection keeps the decision it started with, including the policy index encoded in its mark; if a reload reorders the policies, that index may now belong to a different policy. Existing connections are not re-evaluated against the new configuration, new connections follow it. Reboot, or restart the client's connections, if that matters after a reorder.
+
 <a id="coexistence-with-pbr-and-mwan3"></a>
 ## Coexistence with pbr and mwan3
 shunt is an independent implementation, not a fork of `pbr` and not a drop-in for it - there is no config migration and no attempt at feature parity. Within its scope it is a full alternative.
@@ -494,7 +538,7 @@ Running both at once during a migration is safe by construction:
 
 | | pbr | mwan3 | shunt |
 | :--- | :--- | :--- | :--- |
-| fwmark mask | `0x00ff0000` | `0x00003f00` | `0xff000000` |
+| fwmark and ct mark mask | `0x00ff0000` | `0x00003f00` | `0xff000000` |
 | ip rule pref | 30000 counting down | ~1001-3250 | 31000 and 31500 counting up |
 | routing tables | dynamic from ~256 | 1-250 | 8000+n |
 | nft | chains in fw4's table | | own `inet shunt` table |
@@ -584,10 +628,11 @@ These are consequences of the design, stated rather than worked around:
 * **Clients that speak DoH or DoT themselves are invisible to snoop.** poll still covers the names you list explicitly; wildcards do not work for those clients. A *resolver* forwarding upstream over DoT or DoH changes nothing.
 * **Wildcards require snoop.** poll can only resolve names it was given, and `*.example.com` is not a name.
 * **One CDN address serves many domains.** If a policy routes `example.com` and the address behind it also serves a thousand other sites, those sites follow the same policy. This is unsolvable at layer 3 by anything that routes on addresses.
-* **The first connection to a newly seen address takes the old path.** snoop learns from the response the client is reading at that moment, so the client's SYN is usually out before the element reaches the set. Measured on a live router: the entire first connection stayed on the normal uplink, and the next connection to the same host started on the policy interface. The switch happens at a connection boundary; shunt does not touch conntrack, so no established flow is ever yanked to a different exit mid-stream. Listing the entry point explicitly closes the gap, because poll warms it before any client asks.
+* **The first connection to a newly seen address takes the old path.** snoop learns from the response the client is reading at that moment, so the client's SYN is usually out before the element reaches the set. That connection stays where it started, by design: a flow's route is decided on its first packet and kept on the conntrack entry, so the switch happens at a connection boundary and never mid-stream - see [What shunt creates on the system](#what-shunt-creates-on-the-system). The next connection to the same host starts on the policy interface. Listing the entry point explicitly closes the gap, because poll warms it before any client asks.
 * **DNS over TCP is not observed.** Port 53 over TCP needs reassembly, which is out of scope; answers large enough to force TCP are rare in the traffic shunt cares about.
 * **Route and rule application is best effort.** At boot a tunnel interface may not exist yet. A rule over an empty table falls through to `main`, so the failure mode is "policy not applied yet", never "traffic broken". Each distinct reason is one warning line.
 * **No interface hotplug.** A device that appears later is picked up on the next `ifup` event or within one poll interval, not immediately.
+* **tproxy is detected by its module file.** shunt applies a tproxy policy when `nft_tproxy` is loaded or installed under `/lib/modules`. A custom kernel with tproxy built in has neither, and its tproxy policies are skipped as an issue.
 * **An outside flush of nftables is repaired, not prevented.** Any tool may delete shunt's table - `fw4 flush` does. shunt re-applies it within one poll interval, or sooner, and until then nothing is marked.
 
 **Out of scope permanently:** resolver-integrated set population (dnsmasq `nftset`, AdGuard Home etc.). Being independent of the DNS backend is the entire point of the project, so adopting a backend-specific mechanism would give up the one property that distinguishes it. Also out: DSCP tagging and user include files.
