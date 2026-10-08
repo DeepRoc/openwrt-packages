@@ -1,6 +1,17 @@
---- a/meson.build
-+++ b/meson.build
-@@ -1239,7 +1239,7 @@ if host_system == 'windows' and (cc.get_
+Index: glib-2.88.1/meson.build
+===================================================================
+--- glib-2.88.1.orig/meson.build
++++ glib-2.88.1/meson.build
+@@ -610,8 +610,6 @@ if cc.get_id() == 'gcc' or cc.get_id() =
+     # Due to pervasive use of things like GPOINTER_TO_UINT(), we do not support
+     # building with -Wbad-function-cast.
+     '-Wno-bad-function-cast',
+-    '-Werror=implicit-function-declaration',
+-    '-Werror=missing-prototypes',
+     '-Werror=pointer-sign',
+     '-Wno-string-plus-int',
+     # We require a compiler that supports C11 even though it's not yet a
+@@ -1239,7 +1237,7 @@ if host_system == 'windows' and (cc.get_
    glib_conf.set('HAVE_C99_SNPRINTF', false)
    glib_conf.set('HAVE_C99_VSNPRINTF', false)
    glib_conf.set('HAVE_UNIX98_PRINTF', false)
